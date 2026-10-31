@@ -11,14 +11,22 @@ import re
 import subprocess
 import time
 
+BUDGET_DEADLINE=None
+class WindowEnded(RuntimeError):
+    pass
+
 ISSUE = """id number title state updatedAt url comments(last:1){nodes{id updatedAt}}"""
 THREAD = """nodes{id isResolved comments(last:1){nodes{id updatedAt}}} pageInfo{hasNextPage endCursor}"""
 PR_META = ISSUE + """ headRefOid reviewDecision isDraft
  commits(last:1){nodes{commit{statusCheckRollup{state}}}}"""
+CHECKS = """nodes{__typename
+ ... on CheckRun{id name status conclusion detailsUrl startedAt completedAt checkSuite{app{databaseId slug}}}
+ ... on StatusContext{id context state targetUrl creator{login}}
+ } pageInfo{hasNextPage endCursor}"""
 PR = ISSUE + """ headRefOid reviewDecision isDraft
  reviews(last:1){nodes{id state submittedAt body}}
  reviewThreads(first:100){""" + THREAD + """}
- commits(last:1){nodes{commit{statusCheckRollup{state}}}}"""
+ commits(last:1){nodes{commit{oid statusCheckRollup{state contexts(first:100){"""+CHECKS+"""}}}}}"""
 QUERY = """query($owner:String!,$name:String!,$ia:String,$pa:String){
  repository(owner:$owner,name:$name){
  issues(first:50,after:$ia,orderBy:{field:UPDATED_AT,direction:DESC}){
@@ -42,8 +50,11 @@ def atomic(path,value):
     finally:
         os.close(descriptor)
 def gh(args,payload=None):
+    left=30 if BUDGET_DEADLINE is None else BUDGET_DEADLINE-time.monotonic()
+    if left<=0:
+        raise WindowEnded("Active window expired before API call")
     r=subprocess.run(["gh","api",*args],input=json.dumps(payload) if payload else None,
-                     text=True,capture_output=True,timeout=30)
+                     text=True,capture_output=True,timeout=min(30,left))
     if r.returncode:
         raise RuntimeError("GitHub API failed; checkpoint retained (exit "+str(r.returncode)+")")
     return json.loads(r.stdout)
@@ -77,6 +88,22 @@ def inventory(repo):
                     node=detail["repository"]["pullRequest"]
                     rate=detail["rateLimit"]
                     total_cost+=rate["cost"]
+                    commits=node["commits"]["nodes"]
+                    if commits and commits[-1]["commit"]["statusCheckRollup"]:
+                        commit=commits[-1]["commit"]
+                        checks=commit["statusCheckRollup"]["contexts"]
+                        contexts=list(checks["nodes"])
+                        while checks["pageInfo"]["hasNextPage"]:
+                            extra=graphql("""query($owner:String!,$name:String!,$oid:GitObjectID!,$after:String!){
+                             repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{
+                              statusCheckRollup{contexts(first:100,after:$after){"""+CHECKS+"""}}}}}
+                             rateLimit{cost remaining resetAt}}""",
+                             {"owner":owner,"name":name,"oid":commit["oid"],"after":checks["pageInfo"]["endCursor"]})
+                            checks=extra["repository"]["object"]["statusCheckRollup"]["contexts"]
+                            contexts.extend(checks["nodes"])
+                            rate=extra["rateLimit"]
+                            total_cost+=rate["cost"]
+                        commit["statusCheckRollup"]["contexts"]={"nodes":contexts}
                     thread_page=node["reviewThreads"]
                     threads=list(thread_page["nodes"])
                     while thread_page["pageInfo"]["hasNextPage"]:
@@ -105,16 +132,20 @@ def collect(repo,state,root):
     events=[]
     def emit(kind,key,value,url,actor=None):
         fingerprint=digest(value)
-        if state["seen"].get(key)==fingerprint:
+        prior=state["seen"].get(key)
+        if type(prior) is str:  # Migrate an older content-only checkpoint.
+            prior={"fingerprint":prior,"event_id":digest([key,prior])}
+        if prior and prior["fingerprint"]==fingerprint:
             return
-        event_id=digest([key,fingerprint])
+        previous_id=prior["event_id"] if prior else None
+        event_id=digest([key,previous_id,fingerprint])
         record={"event_id":event_id,"kind":kind,"key":key,"url":url,"actor":actor,
-                "detected_utc":datetime.now(timezone.utc).isoformat(),"value":value}
+                "previous_event_id":previous_id,"detected_utc":datetime.now(timezone.utc).isoformat(),"value":value}
         # Durable event file precedes the collector checkpoint.
         path=root/"events"/(event_id+".json")
         if not path.exists():
             atomic(path,record)
-        state["seen"][key]=fingerprint
+        state["seen"][key]={"fingerprint":fingerprint,"event_id":event_id}
         events.append(record)
     for key,node in snapshot.items():
         fingerprint=digest(node)
@@ -140,6 +171,7 @@ def collect(repo,state,root):
     return events,rate
 
 def main():
+    global BUDGET_DEADLINE
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo",default="robinmordasiewicz/agent-buzz")
     parser.add_argument("--state-dir",type=Path,default=Path.home()/".local/state/agent-buzz/github")
@@ -160,10 +192,14 @@ def main():
     if state["repo"]!=args.repo:
         raise SystemExit("Use a separate state directory for each repository")
     deadline=time.monotonic()+args.seconds
+    BUDGET_DEADLINE=deadline
     interval=5
     announced=set()
     while True:
         started=time.monotonic()
+        if started>=deadline:
+            print(json.dumps({"event":"waiting","last_checked":state.get("last_checked_utc")}),flush=True)
+            break
         try:
             events,rate=collect(args.repo,state,root)
             # Show pending events again after reconnect; processing is separate.
@@ -181,7 +217,13 @@ def main():
                 print(json.dumps({"event":"rate_backoff","seconds":interval}),flush=True)
             if announced and not args.stream:
                 break
+        except WindowEnded:
+            print(json.dumps({"event":"waiting","last_checked":state.get("last_checked_utc")}),flush=True)
+            break
         except (RuntimeError,ValueError,KeyError,OSError,subprocess.TimeoutExpired) as error:
+            if time.monotonic()>=deadline:
+                print(json.dumps({"event":"waiting","last_checked":state.get("last_checked_utc")}),flush=True)
+                break
             interval=min(max(10,interval*2),60)
             print(json.dumps({"event":"poll_error","error":str(error),"backoff_seconds":interval}),flush=True)
         remaining=deadline-time.monotonic()
@@ -189,6 +231,8 @@ def main():
             print(json.dumps({"event":"waiting","last_checked":state.get("last_checked_utc")}),flush=True)
             break
         time.sleep(min(max(0,started+interval-time.monotonic()),remaining))
+    lock.close()
+    BUDGET_DEADLINE=None
 
 if __name__=="__main__":
     main()

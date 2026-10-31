@@ -42,8 +42,12 @@ under ~/.local/state/agent-buzz/github by default; --state-dir separates consume
 It observes all issues/PRs with paginated inventories, uses thin GraphQL state
 and complete paginated REST comment/review reconciliation after changes, and
 records events before advancing its collector checkpoint. Event files and
-checkpoint renames are fsynced. Event IDs include content fingerprints so edits
-are new events. Restarting before a checkpoint reuses the same event file.
+checkpoint renames are fsynced. Event IDs chain the previous observed transition
+and a content fingerprint. A later return to an earlier state is a new event;
+restarting before a checkpoint reuses the same transition event file.
+Individual CI identities/status/conclusions are reconciled even when their
+aggregate remains unchanged. New API/page operations do not start after the
+active deadline, and their timeouts are capped to the remaining window.
 
 The collector never posts or ACKs. A model/operator reviews pending events and
 records handled event IDs in processed.json (a JSON list) after acting. Stream

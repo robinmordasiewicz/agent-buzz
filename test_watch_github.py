@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 import tempfile
+import io
+import contextlib
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from tools import watch_github as watch
@@ -50,6 +53,38 @@ class CollectorTests(unittest.TestCase):
             events,_=watch.collect("owner/repo",self.state,self.root)
         self.assertEqual([e["kind"] for e in events],["comment"])
         self.assertEqual(len(list((self.root/"events").glob("*.json"))),3)
+    def test_return_to_prior_state_is_a_new_transition_even_if_processed(self):
+        identities=[]
+        for status in ("PENDING","SUCCESS","PENDING"):
+            node={"number":3,"url":"https://github.com/owner/repo/pull/3",
+                  "headRefOid":"same-head","updatedAt":"same-time",
+                  "aggregate":"PENDING","individual_check":{"id":"same-check","state":status}}
+            with patch.object(watch,"inventory",return_value=({"pr:3":node},self.rate)),patch.object(watch,"gh",return_value=self.topic),patch.object(watch,"pages",return_value=[]):
+                events,_=watch.collect("owner/repo",self.state,self.root)
+            identities.append(next(e["event_id"] for e in events if e["kind"]=="pr_state"))
+            if len(identities)==1:
+                (self.root/"processed.json").write_text(json.dumps(identities))
+        self.assertEqual(len(set(identities)),3)
+        self.assertNotIn(identities[-1],json.loads((self.root/"processed.json").read_text()))
+    def test_no_poll_starts_at_expired_deadline(self):
+        clock=[0.0]
+        calls=[]
+        def collect(*_):
+            calls.append(clock[0])
+            return [],self.rate
+        def sleep(seconds):
+            clock[0]+=seconds
+        with patch("sys.argv",["watch","--repo","owner/repo","--state-dir",str(self.root),"--seconds","1","--stream"]),patch.object(watch,"collect",side_effect=collect),patch.object(watch.time,"monotonic",side_effect=lambda:clock[0]),patch.object(watch.time,"sleep",side_effect=sleep),contextlib.redirect_stdout(io.StringIO()):
+            watch.main()
+        self.assertEqual(calls,[0.0])
+    def test_api_timeout_uses_remaining_window(self):
+        with patch.object(watch,"BUDGET_DEADLINE",10.0),patch.object(watch.time,"monotonic",return_value=9.75),patch.object(watch.subprocess,"run",return_value=SimpleNamespace(returncode=0,stdout="{}",stderr="")) as run:
+            watch.gh(["graphql"])
+        self.assertEqual(run.call_args.kwargs["timeout"],.25)
+        with patch.object(watch,"BUDGET_DEADLINE",10.0),patch.object(watch.time,"monotonic",return_value=10.0),patch.object(watch.subprocess,"run") as run:
+            with self.assertRaises(watch.WindowEnded):
+                watch.gh(["graphql"])
+            run.assert_not_called()
 
 if __name__=="__main__":
     unittest.main()
