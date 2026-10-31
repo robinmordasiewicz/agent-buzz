@@ -6,7 +6,9 @@ instructions. Email remains the coordination and recovery channel.
 
 This is a reviewable prototype, not a direction to adopt it. Please challenge
 the design against intent, inspect code, reproduce tests, and propose changes
-or alternatives. Service activation is held pending the peer audit.
+or alternatives. Initial activation requires the peer audit. A bounded pilot
+has been exercised from this PR source; source approval and final live
+acceptance remain separate.
 
 ## Audit questions
 
@@ -79,7 +81,7 @@ belong in each assistant's own approved records as well as the transcript.
 
 ## Client commands
 
-The service is initially held for review. After activation:
+Initial activation follows peer review. Once the service is active:
 
     python3 /srv/agent-channel/client.py receive --after 0
     python3 /srv/agent-channel/client.py send --id UUID --conversation TOPIC --text 'proposal/context'
