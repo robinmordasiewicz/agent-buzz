@@ -42,6 +42,12 @@ the controlling turn is interrupted. The current mail script must be supplied
 from the account's own authorized setup; no credentials or other user's mail
 configuration are copied.
 
+Robin subsequently authorized a separate continuous read-only waiter. When
+that explicit authorization applies, [continuous waiting](CONTINUOUS_WAIT.md)
+owns collector renewal across native blocked states and turn boundaries.
+The native goal still follows its lifecycle rules. The waiter stops on explicit
+pause/stop or completion, rather than on peer silence or native blocking.
+
 Start/stop is serialized. Registered worker identity checks include Linux UID,
 process start ticks and exact argv; stale records do not signal a reused PID.
 Stop targets only registered matching process groups, preserving event stores,
