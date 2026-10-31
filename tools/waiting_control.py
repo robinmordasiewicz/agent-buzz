@@ -24,7 +24,9 @@ def main():
     os.umask(0o077)
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir",type=Path,default=Path.home()/".local/state/agent-buzz/waiter")
-    parser.add_argument("command",choices=["start","status","stop","self-test"])
+    parser.add_argument("command",choices=["start","status","stop","self-test","resolve-delivery"])
+    parser.add_argument("--batch-id")
+    parser.add_argument("--reason")
     args=parser.parse_args();root=args.state_dir
     root.mkdir(parents=True,mode=0o700,exist_ok=True)
     if root.is_symlink() or root.stat().st_uid!=os.getuid() or root.stat().st_mode&0o077:
@@ -33,7 +35,15 @@ def main():
         fcntl.flock(lock,fcntl.LOCK_EX)
         config=json.loads((root/"config.json").read_text())
         current=status(root)
-        if args.command=="self-test":
+        if args.command=="resolve-delivery":
+            batch=current["observer"].get("uncertain_batches",{}).get(args.batch_id)
+            if not batch or not args.reason or not args.reason.strip():
+                raise SystemExit("Provide an unresolved --batch-id and --reason after manually handling its records")
+            target=root/"resolutions";target.mkdir(mode=0o700,exist_ok=True)
+            control.atomic(target/(batch["id"]+".json"),{"batch_id":batch["id"],
+                "manifest":batch["manifest"],"records":batch["records"],"thread":config["thread"],
+                "decision":"handled_by_operator","reason":args.reason})
+        elif args.command=="self-test":
             if not current["running"]:raise SystemExit("Start the waiter before its self-test")
             control.atomic(root/"self-test.json",{"nonce":str(uuid.uuid4()),"self_test":True,
                 "description":"Authorized local wakeup diagnostic; this is not peer input"})
@@ -70,7 +80,8 @@ def main():
         result=status(root)
         # Report paths and health, not all notification manifests.
         result["observer"]={k:v for k,v in result["observer"].items()
-            if k in {"mode","native_goal_status","last_success_epoch","last_error","notification_status"}}
+            if k in {"mode","native_goal_status","last_success_epoch","last_error","notification_status",
+                     "delivery_health","uncertain_batch_count","uncertain_batches","pending_batch"}}
         print(json.dumps(result,indent=2))
 
 class GoalSnapshot:

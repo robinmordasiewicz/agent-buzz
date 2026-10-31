@@ -43,7 +43,7 @@ class WaitingTests(unittest.TestCase):
             wait.notify({},self.state,self.root,{"mail:1":"record"},send=lost)
         restarted=json.loads((self.root/"observer.json").read_text())
         self.assertFalse(wait.notify({},restarted,self.root,{},send=lost,reconcile=lambda _:False))
-        self.assertTrue(wait.notify({},restarted,self.root,{},send=lost,reconcile=lambda _:True))
+        self.assertFalse(wait.notify({},restarted,self.root,{},send=lost,reconcile=lambda _:True))
         self.assertEqual(len(sent),1)
         self.assertIn("mail:1",restarted["notified"])
     def test_peer_filter_excludes_own_github_updates_and_processed_mail(self):
@@ -75,11 +75,20 @@ class WaitingTests(unittest.TestCase):
         self.assertEqual(recovered,records)
     def test_rollout_reconciliation_requires_actual_user_record(self):
         path=self.root/"rollout.jsonl"
-        path.write_text(json.dumps({"payload":{"role":"assistant","text":"batch"}})+"\n")
-        self.assertFalse(wait.already_recorded(path,"batch"))
+        batch={"id":"hash","manifest":"expected-file","records":{"mail:1":"record"}}
+        config={"rollout":str(path),"thread":"expected-thread"}
+        meta={"type":"session_meta","payload":{"id":"expected-thread"}}
+        def user(text):return json.dumps({"type":"event_msg","payload":{"type":"user_message","message":text}})+"\n"
+        path.write_text(json.dumps(meta)+"\n"+user('Investigate missing batch hash; it has not reached the intended thread.'))
+        self.assertFalse(wait.already_recorded(config,batch))
+        wrong={**wait.notification(batch),"manifest":"wrong-file"}
+        with path.open("a") as handle:handle.write(user(json.dumps(wrong)))
+        self.assertFalse(wait.already_recorded(config,batch))
         with path.open("a") as handle:
-            handle.write(json.dumps({"payload":{"type":"user_message","message":"batch"}})+"\n")
-        self.assertTrue(wait.already_recorded(path,"batch"))
+            handle.write(user(json.dumps(wait.notification(batch))))
+            handle.write(user('x'*(4*1024*1024+1)))
+        self.assertTrue(wait.already_recorded(config,batch))
+        self.assertFalse(wait.already_recorded({**config,"thread":"other-thread"},batch))
     def test_only_expired_or_terminal_collectors_are_restarted(self):
         state={"goal_thread":"thread","expires_epoch":100,"workers":[]}
         path=self.root/"control.json";path.write_text(json.dumps(state))
@@ -94,6 +103,65 @@ class WaitingTests(unittest.TestCase):
         sent=[]
         wait.notify({},self.state,self.root,{"selftest:nonce":"diagnostic"},send=sent.append)
         self.assertEqual(json.loads(sent[0])["event"],"agent_buzz_waiter_self_test")
+
+    def test_github_state_failure_head_and_topic_edit_ignore_original_author(self):
+        github=self.root/"github";(github/"events").mkdir(parents=True)
+        config={"peer_login":"peer"}
+        old={"event_id":"old","kind":"pr_state","actor":None,"value":{
+            "headRefOid":"a","commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}}}
+        (github/"events/old.json").write_text(json.dumps(old))
+        failure={**old,"event_id":"failure","previous_event_id":"old","value":{
+            "headRefOid":"b","commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]}}}
+        self.assertTrue(wait.github_relevant(failure,config,github))
+        mail=self.root/"mail";(mail/"inbox").mkdir(parents=True)
+        (mail/"state.json").write_text(json.dumps({"processed_message_ids":[]}))
+        (github/"events/failure.json").write_text(json.dumps(failure))
+        found=wait.pending_records({**config,"mail_dir":str(mail),"github_dir":str(github)},self.state,self.root)
+        self.assertIn("github:failure",found)
+        self.assertFalse(wait.github_relevant(failure,{**config,"github_suppressed_events":{"failure":"already handled own update"}},github))
+        topic={"event_id":"topic","kind":"topic","actor":"original-owner","value":{"title":"edited by someone else","state":"open"}}
+        self.assertTrue(wait.github_relevant(topic,config,github))
+        old_topic={**topic,"event_id":"old-topic","value":{**topic["value"],"updated_at":"before","comments":0}}
+        (github/"events/old-topic.json").write_text(json.dumps(old_topic))
+        own_comment={**topic,"previous_event_id":"old-topic","value":{**topic["value"],"updated_at":"after","comments":1}}
+        self.assertFalse(wait.github_relevant(own_comment,config,github))
+
+    def test_uncertain_batch_does_not_block_later_input_or_resend(self):
+        def lost(_):raise TimeoutError("uncertain")
+        with self.assertRaises(TimeoutError):wait.notify({},self.state,self.root,{"mail:1":"record1"},send=lost)
+        self.assertEqual(self.state["delivery_health"],"degraded_uncertain")
+        sent=[]
+        self.assertTrue(wait.notify({},self.state,self.root,{"mail:1":"record1","mail:2":"record2"},send=sent.append,reconcile=lambda _:False))
+        self.assertEqual(self.state["delivery_health"],"degraded_uncertain")
+        self.assertEqual(self.state["uncertain_batch_count"],1)
+        manifest=json.loads(Path(json.loads(sent[0])["manifest"]).read_text())
+        self.assertEqual(manifest["records"],{"mail:2":"record2"})
+        self.assertNotIn("mail:1",self.state["notified"])
+        batch=next(iter(self.state["uncertain_batches"].values()))
+        (self.root/"resolutions").mkdir()
+        resolution={"thread":"thread","batch_id":batch["id"],"manifest":batch["manifest"],"records":batch["records"],"decision":"handled_by_operator","reason":"inspected and handled records"}
+        path=self.root/"resolutions"/(batch["id"]+".json")
+        path.write_text(json.dumps({**resolution,"thread":"wrong-thread"}))
+        wait.reconcile_batches({"thread":"thread"},self.state,self.root,reconcile=lambda _:False)
+        self.assertEqual(self.state["uncertain_batch_count"],1)
+        path.write_text(json.dumps(resolution))
+        wait.reconcile_batches({"thread":"thread"},self.state,self.root,reconcile=lambda _:False)
+        self.assertEqual(self.state["delivery_health"],"ready")
+        self.assertIn("mail:1",self.state["notified"])
+
+    def test_quoted_or_other_role_notifications_do_not_reconcile(self):
+        path=self.root/"rollout.jsonl"
+        batch={"id":"hash","manifest":"expected","records":{"mail:1":"record"}}
+        text=json.dumps(wait.notification(batch))
+        events=[{"type":"session_meta","payload":{"id":"thread"}},
+            {"type":"event_msg","payload":{"type":"user_message","message":'> '+text}},
+            {"type":"response_item","payload":{"role":"assistant","content":[{"type":"input_text","text":text}]}},
+            {"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":text},{"type":"input_text","text":"quoted"}]}}]
+        path.write_text(''.join(json.dumps(e)+'\n' for e in events))
+        config={"rollout":str(path),"thread":"thread"}
+        self.assertFalse(wait.already_recorded(config,batch))
+        with path.open('a') as handle:handle.write(json.dumps({"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":text}]}})+'\n')
+        self.assertTrue(wait.already_recorded(config,batch))
 
 if __name__=="__main__":
     unittest.main()

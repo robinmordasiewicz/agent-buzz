@@ -19,11 +19,37 @@ monitors unprocessed peer mail, peer-authored GitHub events and direct messages.
 It writes notification manifests before attempting delivery. Observer cursors
 are separate from agent processing checkpoints.
 
-One notification is accepted per manifest; pending/uncertain delivery is
-reconciled against actual user-message records in this thread's own rollout.
-An uncertain notification is not blindly resent. Data remains durable even
-when wakeup delivery needs reconciliation; do not claim exactly-once agent
-processing. Acknowledging terminal transport is not semantic acceptance.
+One notification is accepted per manifest. Uncertain attempts move into a
+separate durable queue; later batches continue without resending uncertain
+records. Status exposes delivery_health=degraded_uncertain, unresolved batch
+count and exact manifests. Fresh collector polls alone do not prove delivery
+health. Reconciliation scans the full rollout, verifies its session metadata
+matches the configured thread, and requires an exact structured notification
+with the expected event, batch ID, manifest and authorization field. Prose
+mentions, quotations, other roles and other sessions do not count.
+
+If no exact receipt exists, inspect the unresolved manifest and manually
+handle its records under existing permissions. Then explicitly record that
+operator decision with:
+
+    agent-buzz-wait resolve-delivery --batch-id HASH --reason 'How I handled the records'
+
+This writes a private resolution request bound to the exact thread, manifest
+and records. The waiter validates it and retains an operator_handled receipt,
+distinct from transport evidence. It never resends that batch or marks source
+approval/agreement. If the operator cannot handle it, leave it unresolved;
+later input continues. A crash or unreadable rollout retains uncertainty.
+Do not claim exactly-once agent processing. Transport acceptance is separate
+from semantic acceptance.
+
+GitHub comments and reviews use peer authorship. Topic and PR state transitions
+use semantic projections instead: CI/head/review/thread-resolution changes
+remain relevant when actor is absent or the original topic creator is Robin.
+Changes only to comment/update metadata are suppressed. Already-handled own
+changes require an explicit processing checkpoint or a private
+github_suppressed_events map from exact event IDs to reasons. Original topic
+authorship never proves who edited a topic. State notifications convey data,
+not permission to act.
 
 Collectors restart only when terminal or their bounded window expires. API
 errors back off while the waiter stays alive. The supervisor reads native goal
