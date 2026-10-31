@@ -22,6 +22,8 @@ record that blocker rather than claiming activation.
     python3 tools/loop_control.py stop --thread CODEX_THREAD_UUID
 
 A local installation may expose the same command as agent-buzz-loop.
+The Linux entry point uses the system /usr/bin/python3 verified by this
+project's tests; the user-selected Python can differ in process-spawn support.
 Windows are 1..900 seconds, with a five-second target in the underlying
 collectors and error/rate backoff. The native goal renews expired windows
 explicitly while work remains authorized. Starting twice reuses live workers;

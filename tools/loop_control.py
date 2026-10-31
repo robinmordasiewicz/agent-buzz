@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Control bounded read-only collectors; native Codex goals govern agent work."""
 import argparse
 from datetime import datetime,timezone
