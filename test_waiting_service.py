@@ -46,6 +46,32 @@ class WaitingTests(unittest.TestCase):
         self.assertFalse(wait.notify({},restarted,self.root,{},send=lost,reconcile=lambda _:True))
         self.assertEqual(len(sent),1)
         self.assertIn("mail:1",restarted["notified"])
+    def test_busy_target_holds_batch_and_prunes_handled_records(self):
+        config={"thread":"expected"}
+        pane={"result":{"pane":{"agent_session":{"value":"expected"},
+             "agent_status":"working","pane_id":"pane"}}}
+        with patch.object(wait,"call",return_value=pane) as call:
+            self.assertFalse(wait.notify(config,self.state,self.root,{"mail:1":"record"}))
+            self.assertFalse(self.state["pending_batch"]["attempted"])
+            self.assertEqual(call.call_count,1)
+        # The assistant processes the mail while busy. It must not be woken for it.
+        self.assertFalse(wait.notify(config,self.state,self.root,{},send=lambda _:self.fail("stale wake")))
+        self.assertIsNone(self.state["pending_batch"])
+        self.assertNotIn("mail:1",self.state["notified"])
+
+    def test_busy_batch_coalesces_new_records_into_one_idle_wake(self):
+        config={"thread":"expected"}
+        pane={"result":{"pane":{"agent_session":{"value":"expected"},
+             "agent_status":"working","pane_id":"pane"}}}
+        with patch.object(wait,"call",return_value=pane):
+            wait.notify(config,self.state,self.root,{"mail:1":"one"})
+            wait.notify(config,self.state,self.root,{"mail:1":"one","mail:2":"two"})
+        sent=[]
+        self.assertTrue(wait.notify(config,self.state,self.root,
+                                   {"mail:1":"one","mail:2":"two"},send=sent.append))
+        self.assertEqual(len(sent),1)
+        self.assertEqual(len(json.loads(Path(json.loads(sent[0])["manifest"]).read_text())["records"]),2)
+
     def test_peer_filter_excludes_own_github_updates_and_processed_mail(self):
         mail=self.root/"mail";github=self.root/"github"
         (mail/"inbox").mkdir(parents=True);(github/"events").mkdir(parents=True)

@@ -71,3 +71,53 @@ This is an explicitly started process, not a boot scheduler. A host restart
 requires starting it again from the authorized managed context. The previously
 installed agent-buzz-loop still controls individual bounded windows; persistent
 waiting uses this independent supervisor instead of empty native goal turns.
+
+## Recoverable waiting (issue #10)
+
+The optional `waiting_launcher.py` and user-service template in
+`contrib/agent-buzz-wait.service` provide supervised recovery. Deploy only after
+independent review. Keep the current waiter running until the reviewed service
+is ready to take ownership, then stop the old instance before starting the unit.
+Do not run two supervisors against one state directory.
+
+Pair explicitly from the intended managed pane using `herdr context issue`.
+Pass that one-time payload directly to `context claim` for a stable consumer ID.
+Retain the returned JSON in private `herdr-lease.json` and the endpoint/consumer
+ID in private `pairing.json` beside `config.json`. Do not log the payload or
+lease, put them in command arguments, or commit them. The launcher supplies the
+opaque lease on stdin to `context resolve` before launch and every ten seconds
+while running. Only the returned allowlisted Herdr environment is passed to the
+worker. Every launch requires the original Codex thread to occupy that pane.
+Missing/revoked pairing or another thread suspends control with bounded backoff;
+it never picks another pane, starts a new writer, or repairs a lease silently.
+Unavailable pairing/runtime may interrupt collection until recovery. Existing
+events and checkpoints remain on disk. No uninterrupted-availability claim is
+made during that interval.
+
+The owning daemon endpoint comes from `codex app-server daemon version`, with
+live socket ownership/type checks. An endpoint change gracefully stops the old
+worker before updating its config and relaunching. Goal/objective validation
+remains in the reviewed waiter. A clean goal pause/completion/changed-objective
+exit stops supervision; abnormal process exit is restarted by the service
+manager. The launcher catches TERM, stops its child, and the unit kills its own
+cgroup on timeout. Explicit stop must use `systemctl --user disable --now
+agent-buzz-wait.service` so boot startup is disabled too. Do not rely on the
+legacy manual stop command to disable a service manager.
+
+With a reviewed, enabled unit and an already-enabled lingering user manager,
+startup is scheduled after reboot. This does not prove that the Herdr lease,
+pane or Codex runtime survives reboot. If those are unavailable the unit retains
+its records, backs off, and requires a legitimate restored pairing before
+control. Never bypass pane ownership or writer locks to recover. Verify actual
+same-thread receipt separately from process startup. Rollback disables/stops the
+unit and restores the previously reviewed manual waiter from the managed pane;
+keep all journals and delivery-resolution records.
+
+Notifications now wait for an idle/done matching pane. Busy periods coalesce
+all pending records into one small reference-only wake manifest. Immediately
+before admission, the waiter rebuilds an unattempted batch from fresh processing
+checkpoints so already-handled records do not generate stale turns. Historical
+manifests are retained; attempted/uncertain batches keep their original identity
+and are never resent. Peer comments/reviews and semantic state transitions are
+preserved. Waiting reports `awaiting_peer` independently of native goal status;
+a successful cycle clears the current error while retaining its historical time.

@@ -178,7 +178,7 @@ def notify(config,state,root,records,send=None,reconcile=None):
     records={key:value for key,value in records.items() if key not in excluded}
     control.atomic(root/"observer.json",state)
     if not batch and records:
-        records=dict(sorted(records.items())[:20])
+        records=dict(sorted(records.items()))
         bid=digest(list(records))
         manifest=root/"events"/("wake-"+bid+".json")
         control.atomic(manifest,{"batch_id":bid,"records":records,"source":"read-only peer event collector"})
@@ -190,9 +190,16 @@ def notify(config,state,root,records,send=None,reconcile=None):
         control.atomic(root/"observer.json",state)
         return False
     if not batch["attempted"]:
+        # Rebuild an unattempted batch from fresh processing checkpoints. A busy
+        # agent may have already handled its records before becoming idle.
+        current={key:value for key,value in records.items()}
+        if batch["records"] != current:
+            state["pending_batch"]=None
+            control.atomic(root/"observer.json",state)
+            return notify(config,state,root,current,send=send,reconcile=reconcile)
         if send is None:
             pane=call(["herdr","pane","current","--current"])["result"]["pane"]
-            if pane.get("agent_session",{}).get("value")!=config["thread"] or pane.get("agent_status") not in {"idle","done","working"}:
+            if pane.get("agent_session",{}).get("value")!=config["thread"] or pane.get("agent_status") not in {"idle","done"}:
                 state["notification_status"]="waiting for the matching usable Codex pane"
                 control.atomic(root/"observer.json",state)
                 return False
@@ -266,7 +273,8 @@ def run(root,config):
                     state["direct_error"]=str(error)
                 control.atomic(state_path,state)
                 notify(config,state,root,records)
-                state.update(mode="waiting",native_goal_status=goal["status"],last_success_epoch=time.time())
+                state.pop("last_error",None)
+                state.update(mode="awaiting_peer",native_goal_status=goal["status"],last_success_epoch=time.time())
                 control.atomic(state_path,state)
                 backoff=5
             except Exception as error:
