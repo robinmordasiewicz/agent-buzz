@@ -32,6 +32,7 @@ HASHES = {
 ROLES = {"robin": 1000, "zeul": 996}
 WARMUP, MEASURED, RETRIES = 8, 256, 8
 RATE, POLL, PAUSE, SECONDS = 20, .1, 15, 120
+CLEANUP_SECONDS = 8  # controller grace plus bounded waits for up to four handles
 SHARED = Path("/srv/agent-channel/run")
 REGISTRY = Path.home() / ".local/state/agent-buzz/baseline-registry"
 
@@ -273,6 +274,10 @@ def consumer(client, config, root, name):
                         and row["sender"] == other and row["recipient"] == config["role"], "Synthetic payload/participants differ")
                 observations.setdefault(row["id"], dict(phase=phase, seq=row["seq"],
                     accepted_utc=row["accepted_utc"], first_observed_utc=observed, poll_started_utc=began))
+            pending_depth = sum("checkpoint_utc" not in row for row in observations.values())
+            for row in page["messages"]:
+                item = observations[row["id"]]
+                item["cached_uncheckpointed_depth"] = max(item.get("cached_uncheckpointed_depth", 0), pending_depth)
             control.atomic(path, observations)
             measured_seen = sum(row["phase"] == "measured" for row in observations.values())
             if name == "fast" and measured_seen >= 64 and not marker.exists():
@@ -304,29 +309,56 @@ def consumer(client, config, root, name):
     raise TimeoutError("Consumer did not catch up within experiment deadline")
 
 
+def stop_new_child(child, pidfd=None):
+    """Bounded fallback for a direct child created by this invocation only.
+
+    Popen.poll() reaps an exited child and prevents a later signal. A live,
+    unreaped direct child retains its PID between this check and signalling;
+    there is no concurrent reaper in these supervisors. This path does not
+    accept stale persisted PID records or discover arbitrary processes.
+    """
+    def send(signum):
+        if child.poll() is not None:
+            return
+        try:
+            if os.getpgid(child.pid) == child.pid:
+                os.killpg(child.pid, signum)
+            elif pidfd is not None:
+                signal.pidfd_send_signal(pidfd, signum)
+            else:
+                child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+    send(signal.SIGTERM)
+    try:
+        child.wait(timeout=.5)
+    except subprocess.TimeoutExpired:
+        send(signal.SIGKILL)
+        child.wait(timeout=.5)
+
+
 def spawn(argv, root, name, state, handles):
     with (root / (name + ".log")).open("ab") as log:
         child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     handles.append(child)
-    # Capture a kernel handle before any poll/reap, protecting partial-start
-    # cleanup even when /proc identity discovery itself fails.
-    fd = os.pidfd_open(child.pid)
+    fd = None
     try:
+        # Acquisition itself can fail (e.g. EMFILE). Every post-Popen failure
+        # must still clean this fresh direct child with a bounded wait.
+        fd = os.pidfd_open(child.pid)
         current = control.identity(child.pid)
         if current is None:
-            signal.pidfd_send_signal(fd, signal.SIGTERM)
-            try:
-                child.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                signal.pidfd_send_signal(fd, signal.SIGKILL)
-                child.wait()
-            raise RuntimeError("Child identity unavailable; kernel-bound cleanup completed")
+            raise RuntimeError("Child identity unavailable")
+        record = dict(name=name, pid=child.pid, argv=argv, start_ticks=current["start_ticks"])
+        state["workers"].append(record)
+        control.atomic(root / "control.json", state)
+        return child, record
+    except BaseException:
+        stop_new_child(child, fd)
+        raise
     finally:
-        os.close(fd)
-    record = dict(name=name, pid=child.pid, argv=argv, start_ticks=current["start_ticks"])
-    state["workers"].append(record)
-    control.atomic(root / "control.json", state)
-    return child, record
+        if fd is not None:
+            os.close(fd)
 
 
 def run_account(client, config, root):
@@ -337,9 +369,8 @@ def run_account(client, config, root):
             argv = [sys.executable, str(Path(__file__).resolve()), "_worker", "--config", str(root / "config.json"), "--name", name]
             active[name] = spawn(argv, root, name, state, handles)
         next_sample = 0
-        # Reserve the existing owned-process controller's two-second termination
-        # grace inside the 120-second bound, not after it.
-        stop_at = min(time.monotonic() + SECONDS, time.monotonic() + max(0, config["deadline"] - time.time())) - 2.1
+        # Reserve controller grace and all bounded handle waits inside the cap.
+        stop_at = min(time.monotonic() + SECONDS, time.monotonic() + max(0, config["deadline"] - time.time())) - CLEANUP_SECONDS
         while active and time.time() < config["deadline"] and time.monotonic() < stop_at:
             if time.time() >= next_sample:
                 append(root / "resources.jsonl", {name: resources(record) for name, (_, record) in active.items()})
@@ -365,7 +396,7 @@ def run_account(client, config, root):
         control.stop_workers(state)
         control.atomic(root / "control.json", state)
         for child in handles:
-            child.wait()
+            stop_new_child(child)
 
 
 def run_broker(config, root):
@@ -381,7 +412,7 @@ def run_broker(config, root):
         argv = [sys.executable, str(Path(config["core_dir"]) / "broker.py"),
                 "--socket", config["socket"], "--db", str(root / "database/messages.sqlite3")]
         child, record = spawn(argv, root, "broker", state, handles)
-        deadline = min(time.monotonic() + SECONDS, time.monotonic() + max(0, config["deadline"] - time.time())) - 2.1
+        deadline = min(time.monotonic() + SECONDS, time.monotonic() + max(0, config["deadline"] - time.time())) - CLEANUP_SECONDS
         while time.time() < config["deadline"] and time.monotonic() < deadline:
             require(child.poll() is None, "Isolated broker exited before deadline")
             append(root / "resources.jsonl", resources(record))
@@ -390,7 +421,7 @@ def run_broker(config, root):
         control.stop_workers(state)
         control.atomic(root / "control.json", state)
         for child in handles:
-            child.wait()
+            stop_new_child(child)
         current = directory.lstat()
         require((current.st_dev, current.st_ino, current.st_uid) ==
                 (original.st_dev, original.st_ino, os.getuid()), "Socket directory identity changed; preserve for inspection")
@@ -416,6 +447,30 @@ def run_broker(config, root):
     require(complete, "Broker fixture is incomplete; retained evidence, no success claim")
 
 
+def observation_metrics(measured, polls):
+    stamp = lambda row: datetime.fromisoformat(row["accepted_utc"]).timestamp()
+    # The pinned broker stamps before INSERT/COMMIT. This is a timestamp-based
+    # backlog proxy, not a count of committed broker messages awaiting processing.
+    queue = sorted([(stamp(row), 1) for row in measured] + [(row["checkpoint_utc"], -1) for row in measured],
+                   key=lambda value: (value[0], -value[1]))
+    depth, maximum = 0, 0
+    for _, delta in queue:
+        depth += delta
+        maximum = max(depth, maximum)
+    return dict(
+        stored_acceptance_timestamp_to_observe_ms=quantiles([(row["first_observed_utc"] - stamp(row)) * 1000 for row in measured]),
+        stored_acceptance_timestamp_to_synthetic_checkpoint_ms=quantiles([(row["checkpoint_utc"] - stamp(row)) * 1000 for row in measured]),
+        stored_timestamp_backlog_proxy_max=maximum,
+        cached_uncheckpointed_messages_max=max((row.get("cached_uncheckpointed_depth", 0) for row in measured), default=0),
+        post_commit_latency_ms=None,
+        committed_broker_queue_depth=None,
+        timestamp_boundary="accepted_utc is generated before INSERT/COMMIT; includes an unmeasured pre-commit interval; exact post-commit latency unavailable",
+        processing_scope="synthetic test event, not model processing; includes unchanged CLI checkpoint overhead",
+        socket_connections=len(polls),
+        exchange_ms=quantiles([(row["observed_utc"] - row["started_utc"]) * 1000 for row in polls]),
+        achieved_poll_hz=((len(polls) - 1) / (polls[-1]["started_utc"] - polls[0]["started_utc"])) if len(polls) > 1 else None)
+
+
 def summarize(root):
     config = json.loads((root / "config.json").read_text())
     require((root / "complete.json").exists(), "Run incomplete; do not publish success metrics")
@@ -434,21 +489,8 @@ def summarize(root):
         rows = json.loads((root / name / "observations.json").read_text())
         require(set(rows) == wanted, "Consumer exact ID set differs")
         measured = [row for row in rows.values() if row["phase"] == "measured"]
-        accepted = lambda row: datetime.fromisoformat(row["accepted_utc"]).timestamp()
-        queue = sorted([(accepted(row), 1) for row in measured] + [(row["checkpoint_utc"], -1) for row in measured], key=lambda v: (v[0], -v[1]))
-        depth, maximum = 0, 0
-        for _, delta in queue:
-            depth += delta
-            maximum = max(depth, maximum)
-        result["consumers"][name] = dict(exact_ids=True,
-            commit_to_observe_ms=quantiles([(row["first_observed_utc"] - accepted(row)) * 1000 for row in measured]),
-            commit_to_synthetic_checkpoint_ms=quantiles([(row["checkpoint_utc"] - accepted(row)) * 1000 for row in measured]),
-            measured_queue_depth_max=maximum,
-            processing_scope="synthetic test event, not model processing; includes unchanged CLI checkpoint overhead")
         polls = [json.loads(line) for line in (root / name / "polls.jsonl").read_text().splitlines()]
-        result["consumers"][name].update(socket_connections=len(polls),
-            exchange_ms=quantiles([(row["observed_utc"] - row["started_utc"]) * 1000 for row in polls]),
-            achieved_poll_hz=((len(polls) - 1) / (polls[-1]["started_utc"] - polls[0]["started_utc"])) if len(polls) > 1 else None)
+        result["consumers"][name] = dict(exact_ids=True, **observation_metrics(measured, polls))
     result["worker_usage"] = [json.loads(line) for line in (root / "usage.jsonl").read_text().splitlines()]
     return result
 

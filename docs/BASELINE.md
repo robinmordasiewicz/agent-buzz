@@ -57,9 +57,15 @@ Processing is a **synthetic test event**, never model processing. Checkpoints
 use the unchanged client's actual CLI; observation time precedes cache/sample
 logging, and checkpoint time includes CLI and instrumentation overhead.
 Sender time covers unchanged client.send including durable outbox work,
-excluding subsequent sample logging. The same workstation wall clock supplies
-commit/receive/checkpoint timestamps; sender elapsed time uses a monotonic
-clock. Report nearest-rank empirical p50/p95/p99, maximum and sample count.
+excluding subsequent sample logging. The pinned broker generates accepted_utc
+before INSERT and before the transaction commits. Stored-acceptance-timestamp
+to observation/checkpoint intervals therefore include an unknown pre-commit
+interval. They are not post-commit delivery latency. The summaries explicitly
+report exact post_commit_latency_ms as unavailable (null) for this unchanged
+baseline; no completed-commit timestamp is inferred. The common workstation
+wall clock supplies those stored/receive/checkpoint timestamps; sender elapsed
+time uses a monotonic clock. Report nearest-rank empirical p50/p95/p99, maximum
+and sample count with the exact boundary labels.
 These samples provide no sustained tail or latency guarantee.
 Requested versus achieved sender/poll pacing and pacing lag are reported.
 Negative wall-clock deltas remain visible as negative_samples rather than
@@ -70,7 +76,10 @@ Private resources.jsonl records sampled owned worker/broker CPU/RSS. Worker
 usage.jsonl also retains lifetime CPU/max-RSS and checkpoint-child CPU,
 including the interrupted incarnation. Poll logs count receive connections;
 sender results count send/retry connections. Consumer summaries reconstruct
-measured queue-depth maxima from accepted and checkpoint timestamps. Raw logs
+timestamp-based backlog proxies from the stored pre-commit timestamp and
+checkpoint times. They separately report observed cached/uncheckpointed input
+depth, not true committed broker queue depth, which is unavailable here.
+Raw logs
 and incomplete runs must be retained so errors and omissions remain visible.
 
 Actual collector detection, thread receipt and model processing are a separate
@@ -136,8 +145,9 @@ Zeul runs the corresponding account command through his own authorized route:
 No helper changes account identity. Broker and participant commands reserve
 private config/control records before starting workers. Each supervisor has
 a monotonic 120-second cap (including any early window wait), and an absolute
-latest deadline at the agreed start plus 120 seconds. Two seconds of owned
-termination grace are reserved inside the cap; excessive lead time/load can
+latest deadline at the agreed start plus 120 seconds. Eight seconds for the
+controller's grace and all bounded handle waits are reserved inside the cap;
+excessive lead time/load can
 make a run inconclusive rather than extend its deadline. Arrange the launches
 close enough to the acknowledged start to leave the agreed recovery interval.
 
@@ -160,8 +170,12 @@ operational data; export only reviewed synthetic aggregate measurements.
 
 Stop by signalling the experiment supervisor whose actual PID/identity you
 started. It cleans only registered UID/start-ticks/exact-argv process groups.
-Partial-start identity failure uses a captured Linux pidfd. It never uses
-broad process-name matching or signals another account. Broker cleanup checks
+Partial-start cleanup also covers failure to acquire a pidfd. It uses the
+fresh direct-child Popen handle with bounded TERM/KILL waits, including when
+no persistent worker record exists. The supervisor has no concurrent reaper;
+an exited child is reaped before signalling and a live unreaped child retains
+its identity. This fallback is never used for arbitrary/stale PID records.
+It never uses broad process-name matching or signals another account. Broker cleanup checks
 the dedicated directory's device/inode/owner and socket type/owner before
 removing that socket and empty directory/ACLs. Database, run registry, logs and
 journals are preserved. Existing collaboration services stay running.

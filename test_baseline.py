@@ -1,5 +1,7 @@
 """Local fixtures, not live two-account or model-wakeup certification."""
 from datetime import datetime, timezone
+import errno
+import importlib.util
 import json
 from pathlib import Path
 import sqlite3
@@ -152,10 +154,69 @@ class BaselineTests(unittest.TestCase):
     def test_identity_discovery_failure_uses_kernel_bound_cleanup(self):
         handles = []
         with patch.object(bench.control, "identity", return_value=None):
-            with self.assertRaisesRegex(RuntimeError, "kernel-bound cleanup"):
+            with self.assertRaisesRegex(RuntimeError, "Child identity unavailable"):
                 bench.spawn([sys.executable, "-c", "import time; time.sleep(30)"], self.root,
                             "fixture", {"workers": []}, handles)
         self.assertIsNotNone(handles[0].poll())
+
+    @unittest.skipUnless(hasattr(bench.os, "getpgid"), "Direct-child process-group fixture requires POSIX")
+    def test_pidfd_acquisition_failure_is_bounded_and_preserves_unrelated_child(self):
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        actual_spawn, handles_seen = bench.spawn, []
+        def fixture_spawn(argv, root, name, state, handles):
+            try:
+                return actual_spawn([sys.executable, "-c", "import time; time.sleep(30)"], root, name, state, handles)
+            finally:
+                handles_seen[:] = handles
+        try:
+            start = time.monotonic()
+            with patch.object(bench, "spawn", side_effect=fixture_spawn), patch.object(
+                    bench.os, "pidfd_open", side_effect=OSError(errno.EMFILE, "fixture descriptor exhaustion"), create=True):
+                with self.assertRaises(OSError):
+                    bench.run_account(None, self.config(), self.root)
+            self.assertLess(time.monotonic() - start, 3)
+            self.assertEqual(len(handles_seen), 1)
+            self.assertIsNotNone(handles_seen[0].poll())
+            self.assertIsNone(unrelated.poll())
+            self.assertEqual(json.loads((self.root / "control.json").read_text())["workers"], [])
+            self.assertFalse((self.root / "complete.json").exists())
+        finally:
+            for child in handles_seen:
+                bench.stop_new_child(child)
+            unrelated.terminate()
+            unrelated.wait(timeout=2)
+
+    def test_delayed_commit_is_not_labelled_as_post_commit_delivery(self):
+        spec = importlib.util.spec_from_file_location("baseline_timestamp_broker", Path(__file__).parent / "broker.py")
+        broker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(broker)
+        path = self.root / "timestamp.sqlite3"
+        broker.initialize(path)
+        original, completed = broker.connect, []
+        class Delayed:
+            def __init__(self, db):self.db = db
+            def __enter__(self):return self
+            def __exit__(self, *args):
+                time.sleep(.06)  # Controlled fault fixture, not a performance sample.
+                result = self.db.__exit__(*args)
+                completed.append(time.time())
+                return result
+            def __getattr__(self, key):return getattr(self.db, key)
+        with patch.object(broker, "connect", side_effect=lambda p:Delayed(original(p))):
+            result = broker.process(path, 1000, bench.request(self.eid, "robin", "measured", 0))
+        self.assertTrue(result["ok"])
+        db = sqlite3.connect(path)
+        try:stamp = db.execute("SELECT accepted_utc FROM messages").fetchone()[0]
+        finally:db.close()
+        self.assertGreater(completed[0] - datetime.fromisoformat(stamp).timestamp(), .05)
+        metrics = bench.observation_metrics([dict(accepted_utc=stamp, first_observed_utc=completed[0],
+            checkpoint_utc=completed[0] + .001, cached_uncheckpointed_depth=1)],
+            [dict(started_utc=completed[0], observed_utc=completed[0] + .001)])
+        self.assertGreater(metrics["stored_acceptance_timestamp_to_observe_ms"]["p50"], 50)
+        self.assertIsNone(metrics["post_commit_latency_ms"])
+        self.assertIsNone(metrics["committed_broker_queue_depth"])
+        self.assertEqual(metrics["cached_uncheckpointed_messages_max"], 1)
+        self.assertNotIn("commit_to_observe_ms", metrics)
 
     def test_broker_start_failure_cleans_only_new_fixture_directory(self):
         shared = bench.private(self.root / "shared")
