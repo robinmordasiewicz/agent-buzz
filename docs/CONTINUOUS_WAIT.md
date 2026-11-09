@@ -9,7 +9,8 @@ The native goal retains its own lifecycle and blocking rules. The waiter stops
 on an explicit waiting stop, native pause/completion/clear, or a changed
 objective. A blocked goal does not stop it. All owner/review gates remain.
 
-The Linux process must start from its naturally inherited managed Herdr pane.
+The manual Linux process starts from its naturally inherited managed Herdr pane.
+The optional paired service mode below resolves explicit external-worker authority.
 It verifies the same Codex thread before delivering a small JSON event
 notification. It never copies another process's Herdr environment, chooses
 another client's focus, starts a new agent or answers an approval prompt.
@@ -67,7 +68,7 @@ The self-test is explicitly labelled diagnostic, not a peer message. Verify
 fresh successful collector polls, window renewal, manifest delivery and the
 actual same-thread wake before claiming operational readiness.
 
-This is an explicitly started process, not a boot scheduler. A host restart
+The manual installation is an explicitly started process, not a boot scheduler. A host restart
 requires starting it again from the authorized managed context. The previously
 installed agent-buzz-loop still controls individual bounded windows; persistent
 waiting uses this independent supervisor instead of empty native goal turns.
