@@ -1,0 +1,20 @@
+# Install only after independent review and explicit local pairing.
+# Replace /ABS/... paths using owner-controlled installation values.
+[Unit]
+Description=Durable read-only agent collaboration waiter
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /ABS/RELEASE/waiting_launcher.py --state-dir /ABS/PRIVATE/STATE --python /ABS/VENV/bin/python --service-script /ABS/REVIEWED/RELEASE/waiting_service.py
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=25
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+StandardOutput=append:/ABS/PRIVATE/STATE/supervisor.log
+StandardError=append:/ABS/PRIVATE/STATE/supervisor.log
+
+[Install]
+WantedBy=default.target
