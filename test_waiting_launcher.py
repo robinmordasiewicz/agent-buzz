@@ -62,7 +62,7 @@ class LauncherTests(unittest.TestCase):
             root=Path(tmp)
             path=root/'config.json';path.write_text(json.dumps({'goal_socket':'current'}));path.chmod(0o600)
             for exit_code in (0,75):
-                child=unittest.mock.Mock()
+                child=unittest.mock.Mock(pid=1234)
                 child.poll.side_effect=[None,exit_code,exit_code]
                 with patch('sys.argv',['launcher','--state-dir',str(root),'--python','python',
                                        '--service-script','reviewed.py']), \
