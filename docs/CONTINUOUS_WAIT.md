@@ -96,8 +96,10 @@ events and checkpoints remain on disk. No uninterrupted-availability claim is
 made during that interval.
 
 The owning daemon endpoint comes from `codex app-server daemon version`, with
-live socket ownership/type checks. An endpoint change gracefully stops the old
-worker before updating its config and relaunching. Goal/objective validation
+live socket ownership/type checks. A validated Herdr context change or daemon endpoint change gracefully stops
+the old worker before updating its config and relaunching. Already-exited
+workers retain their terminal return code before any fallible revalidation,
+and exits observed during context/endpoint/error retirement are preserved. Goal/objective validation
 remains in the reviewed waiter. A clean goal pause/completion/changed-objective
 exit stops supervision; abnormal process exit is restarted by the service
 manager. The launcher catches TERM, stops its child, and the unit kills its own

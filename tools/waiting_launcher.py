@@ -71,13 +71,15 @@ def goal_endpoint(env, run=subprocess.run):
 
 
 def stop_child(child):
-    if child.poll() is None:
-        child.terminate()
-        try:
-            child.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait(timeout=5)
+    code = child.poll()
+    if code is not None:
+        return code  # Preserve an exit observed before we initiate retirement.
+    child.terminate()
+    try:
+        child.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=5)
 
 
 def main():
@@ -98,10 +100,17 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stopping.__setitem__(0, True))
     child = None
+    active_context = None
     backoff = 5
     retry_at = 0
     try:
         while not stopping[0]:
+            # Terminal worker state precedes every fallible revalidation and
+            # backoff. Never erase native pause/completion because IPC is down.
+            if child is not None:
+                code = child.poll()
+                if code is not None:
+                    return code
             if time.monotonic() < retry_at:
                 time.sleep(.2)
                 continue
@@ -110,9 +119,13 @@ def main():
                 endpoint = goal_endpoint(env)
                 config = private_json(root / 'config.json')
                 changed = config.get('goal_socket') != endpoint
-                if changed and child is not None:
-                    stop_child(child)
+                context = {key: env.get(key) for key in HERDR_ENV}
+                if child is not None and (changed or context != active_context):
+                    code = stop_child(child)
+                    if code is not None:
+                        return code
                     child = None
+                    active_context = None
                 if changed:
                     config['goal_socket'] = endpoint
                     atomic(root / 'config.json', config)
@@ -120,6 +133,7 @@ def main():
                     child = subprocess.Popen([args.python, str(args.service_script),
                                               '--state-dir', str(root)], env=env,
                                              start_new_session=True)
+                    active_context = context
                 code = child.poll()
                 if code is not None:
                     # A clean goal stop must not be turned into an endless restart.
@@ -130,8 +144,11 @@ def main():
                 retry_at = time.monotonic() + 10
             except Exception:
                 if child is not None:
-                    stop_child(child)
+                    code = stop_child(child)
+                    if code is not None:
+                        return code
                     child = None
+                    active_context = None
                 atomic(root / 'launcher.json', {'mode': 'awaiting_runtime',
                     'detail': 'Pairing or owning runtime unavailable; no control attempted',
                     'last_failure_epoch': time.time()})
